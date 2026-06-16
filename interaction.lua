@@ -95,7 +95,7 @@ Adapters.ox_textui = (function()
             }
             startDriver()
         end,
-        Remove = function(entity, _id)
+        Remove = function(entity)
             registry[entity] = nil
             if entity == activeEntity then hide() end
         end,
@@ -117,14 +117,14 @@ Adapters.ox_target = {
         end
         exports.ox_target:addLocalEntity(entity, options)
     end,
-    Remove = function(entity, _id)
+    Remove = function(entity)
         exports.ox_target:removeLocalEntity(entity, OPTION_NAMES)
     end,
 }
 
 Adapters.custom = {
-    Add = function(entity, data) end,
-    Remove = function(entity, id) end,
+    Add = function() end,
+    Remove = function() end,
 }
 
 Interaction = Adapters[Config.Interaction] or Adapters.ox_textui

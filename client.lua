@@ -98,7 +98,6 @@ local seatedCar   = nil
 local seatedSpot  = nil
 local cars        = {}
 local gen         = 0
-local ridersByCar = {}
 
 local function seatOffsetForSpot(spot)
     local s = Seats[spot] or Seats[1]
@@ -130,14 +129,6 @@ local function pickFreeSpot(idx)
     for i = 1, #Seats do
         if not taken[i] then return i end
     end
-    return nil
-end
-
-local function getAnchor(idx)
-    local netId = GlobalState['tramAnchor:' .. idx]
-    if not netId or not NetworkDoesNetworkIdExist(netId) then return nil end
-    local e = NetworkGetEntityFromNetworkId(netId)
-    if e ~= 0 and DoesEntityExist(e) then return e end
     return nil
 end
 
@@ -252,7 +243,6 @@ createEntities = function()
             entity = e, trackIndex = index, doors = doors,
             region = region, lastRegion = region,
             doorApplied = nil, doorOpen = 0.0, runningSound = nil,
-            anchorHandle = nil, nextCtrlReq = 0,
         }
         cars[index] = c
         addTramTarget(c)
@@ -283,43 +273,12 @@ startLoops = function()
         while active and myGen == gen do
             local now = Now()
             for idx in pairs(Config.Cars) do
-                local detPos, region, doorOpen, traveling = getCarState(idx, now)
+                local pos, region, doorOpen, traveling = getCarState(idx, now)
                 local c = cars[idx]
                 if c and c.entity and DoesEntityExist(c.entity) then
                     c.region = region; c.doorOpen = doorOpen
                     local o = Config.Cars[idx].offset
-                    local tx, ty, tz = detPos.x + o.x, detPos.y + o.y, detPos.z + o.z
-
-                    local anchor = getAnchor(idx)
-                    if anchor ~= c.anchorHandle then
-                        c.anchorHandle = anchor
-                        if anchor then
-                            SetEntityVisible(anchor, false, false)
-                            SetEntityCollision(anchor, false, false)
-                        end
-                    end
-
-                    if anchor then
-                        if riding and seatedCar == idx then
-                            if NetworkHasControlOfEntity(anchor) then
-                                FreezeEntityPosition(anchor, true)
-                                SetEntityCoordsNoOffset(anchor, tx, ty, tz, false, false, false)
-                                SetEntityHeading(anchor, Config.Cars[idx].heading)
-                            elseif now >= c.nextCtrlReq then
-                                NetworkRequestControlOfEntity(anchor)
-                                c.nextCtrlReq = now + 1000
-                            end
-                        elseif NetworkHasControlOfEntity(anchor) then
-                            FreezeEntityPosition(anchor, true)
-                        end
-                    end
-
-                    if ridersByCar[idx] and anchor then
-                        local ap = GetEntityCoords(anchor)
-                        SetEntityCoords(c.entity, ap.x, ap.y, ap.z, false, false, false, false)
-                    else
-                        SetEntityCoords(c.entity, tx, ty, tz, false, false, false, false)
-                    end
+                    SetEntityCoords(c.entity, pos.x + o.x, pos.y + o.y, pos.z + o.z, false, false, false, false)
 
                     if not c.doorApplied or math.abs(doorOpen - c.doorApplied) > 0.01 then
                         setDoorPos(c, CLOSED + OPENADD * doorOpen)
@@ -331,31 +290,15 @@ startLoops = function()
                         local ped = PlayerPedId()
                         if IsEntityDead(ped) then
                             exitTram(c, true)
-                        elseif anchor and not IsEntityAttachedToEntity(ped, anchor) then
+                        elseif not IsEntityAttachedToEntity(ped, c.entity) then
                             local x, y, z = seatOffsetForSpot(seatedSpot)
-                            AttachEntityToEntity(ped, anchor, -1, x, y, z, 0.0, 0.0, 0.0,
-                                false, false, false, true, 2, true)
+                            AttachEntityToEntity(ped, c.entity, -1, x, y, z, 0.0, 0.0, 0.0,
+                                false, false, false, false, 2, true)
                         end
                     end
                 end
             end
             Wait(0)
-        end
-    end)
-
-    CreateThread(function()
-        while active and myGen == gen do
-            local riders = {}
-            if riding and seatedCar ~= nil then riders[seatedCar] = true end
-            local myId = PlayerId()
-            for _, pid in ipairs(GetActivePlayers()) do
-                if pid ~= myId then
-                    local idx = Player(GetPlayerServerId(pid)).state.tramCar
-                    if idx ~= nil then riders[idx] = true end
-                end
-            end
-            ridersByCar = riders
-            Wait(250)
         end
     end)
 end
@@ -377,59 +320,25 @@ end
 
 boardTram = function(c)
     if riding or boarding or not (c and c.entity and DoesEntityExist(c.entity)) then return end
-    boarding = true
-    CreateThread(function()
-        local idx = c.trackIndex
-        local ped = PlayerPedId()
+    local idx = c.trackIndex
 
-        local cabinPos = GetEntityCoords(c.entity)
-        TriggerServerEvent('tramway:prepareAnchor', idx, cabinPos)
+    local spot = pickFreeSpot(idx)
+    if not spot then
+        lib.notify({ description = 'The tram car is full.', type = 'error' })
+        return
+    end
 
-        local ok, anchor = pcall(function()
-            return lib.waitFor(function()
-                local a = getAnchor(idx)
-                if a then return a end
-            end, 'tram anchor never streamed in', 5000)
-        end)
+    local ped = PlayerPedId()
+    riding = true; seatedCar = idx; seatedSpot = spot
+    LocalPlayer.state:set('tramCar', idx, true)
+    LocalPlayer.state:set('tramSeat', spot, true)
 
-        if not ok or not anchor then
-            boarding = false
-            lib.notify({ description = 'The tram isn\'t ready, try again.', type = 'error' })
-            return
-        end
+    local x, y, z = seatOffsetForSpot(spot)
+    AttachEntityToEntity(ped, c.entity, -1, x, y, z, 0.0, 0.0, 0.0,
+        false, false, false, false, 2, true)
 
-        local t0 = GetGameTimer()
-        while not NetworkHasControlOfEntity(anchor) and GetGameTimer() - t0 < 2000 do
-            NetworkRequestControlOfEntity(anchor)
-            Wait(50)
-        end
-        if NetworkHasControlOfEntity(anchor) then
-            FreezeEntityPosition(anchor, true)
-            SetEntityCoordsNoOffset(anchor, cabinPos.x, cabinPos.y, cabinPos.z, false, false, false)
-            SetEntityHeading(anchor, Config.Cars[idx].heading)
-        end
-        SetEntityVisible(anchor, false, false)
-        SetEntityCollision(anchor, false, false)
-
-        seatedSpot = pickFreeSpot(idx)
-        if not seatedSpot then
-            boarding = false
-            lib.notify({ description = 'The tram car is full.', type = 'error' })
-            return
-        end
-
-        riding = true; seatedCar = idx; boarding = false
-        ridersByCar[idx] = true
-        LocalPlayer.state:set('tramSeat', seatedSpot, true)
-
-        local x, y, z = seatOffsetForSpot(seatedSpot)
-        AttachEntityToEntity(ped, anchor, -1, x, y, z, 0.0, 0.0, 0.0,
-            false, false, false, true, 2, true)
-
-        LocalPlayer.state:set('tramCar', idx, true)
-        TriggerServerEvent('tramway:riding', true)
-        updateSubscription()
-    end)
+    TriggerServerEvent('tramway:riding', true)
+    updateSubscription()
 end
 
 canExitNow = function(c)

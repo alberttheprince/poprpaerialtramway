@@ -9,7 +9,7 @@ Adapters.ox_textui = (function()
 
     local cfg      = Config.TextUI or {}
     local keyLabel = cfg.keyLabel or cfg.key or 'E'
-    local position = cfg.position or 'top-center'
+    local position = cfg.position or 'right-center'
 
     local function uiOptions(opt)
         return {

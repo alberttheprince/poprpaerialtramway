@@ -15,18 +15,17 @@ local bestRtt = math.huge
 RegisterNetEvent('tramway:syncRes', function(t0, serverNow)
     local t1  = GetGameTimer()
     local rtt = t1 - t0
-    if rtt <= bestRtt then
-        bestRtt    = rtt
-        timeOffset = (serverNow + rtt * 0.5) - t1
-    end
+    if rtt > 1000 or rtt >= bestRtt then return end
+    bestRtt    = rtt
+    timeOffset = (serverNow + rtt * 0.5) - t1
 end)
 
 CreateThread(function()
     local function ask() TriggerServerEvent('tramway:syncReq', GetGameTimer()) end
-    for _ = 1, 8 do ask(); Wait(250) end
+    for _ = 1, 3 do ask(); Wait(500) end
     while true do
         Wait(30000)
-        bestRtt = bestRtt + 100
+        bestRtt += 100
         ask()
     end
 end)
@@ -37,7 +36,7 @@ do
         local segs, cum = {}, 0.0
         for i = 1, #nodes - 1 do
             local a, b = nodes[i], nodes[i + 1]
-            local len  = #(vector3(a.x, a.y, a.z) - vector3(b.x, b.y, b.z))
+            local len  = #(a - b)
             segs[i] = { a = a, b = b, len = len, cum = cum }
             cum = cum + len
         end
@@ -49,23 +48,20 @@ local function smoothstep(t) t = lib.math.clamp(t, 0.0, 1.0) return t * t * (3.0
 
 local function posAtArc(track, s)
     local nodes = track.nodes
-    if s <= 0.0 then return vector3(nodes[1].x, nodes[1].y, nodes[1].z) end
-    if s >= track.length then local n = nodes[#nodes] return vector3(n.x, n.y, n.z) end
+    if s <= 0.0 then return nodes[1] end
+    if s >= track.length then return nodes[#nodes] end
     for i = 1, #track.segments do
         local seg = track.segments[i]
         if s <= seg.cum + seg.len then
-            local lt = (s - seg.cum) / seg.len
-            local a, b = seg.a, seg.b
-            local px = a.x + (b.x - a.x) * lt
-            local py = a.y + (b.y - a.y) * lt
-            local pz = a.z + (b.z - a.z) * lt
+            local lt  = (s - seg.cum) / seg.len
+            local pos = lib.math.interp(seg.a, seg.b, lt)
             if seg.len > Config.SagMinLength then
-                pz = pz + (math.abs(lt - 0.5) * 2.0 - 1.0) * Config.SagAmount
+                return vector3(pos.x, pos.y, pos.z + (math.abs(lt - 0.5) * 2.0 - 1.0) * Config.SagAmount)
             end
-            return vector3(px, py, pz)
+            return pos
         end
     end
-    local n = nodes[#nodes] return vector3(n.x, n.y, n.z)
+    return nodes[#nodes]
 end
 
 local function doorOpenAt(tIn, tOut)
@@ -97,6 +93,43 @@ local seatedCar   = nil
 local seatedSpot  = nil
 local cars        = {}
 local gen         = 0
+local seatCache   = {}   -- [carIdx] = { count = N, taken = {spotIdx = true} }
+local tramRiders  = {}   -- [serverId] = { car = idx, seat = spot }, maintained by state bag handlers
+
+local function rebuildSeatCache()
+    local cache = {}
+    for sid, rider in pairs(tramRiders) do
+        local idx = rider.car
+        if idx then
+            if not cache[idx] then cache[idx] = { count = 0, taken = {} } end
+            cache[idx].count = cache[idx].count + 1
+            if rider.seat then cache[idx].taken[rider.seat] = true end
+        end
+    end
+    seatCache = cache
+end
+
+local mySid = GetPlayerServerId(PlayerId())
+AddStateBagChangeHandler('tramCar', nil, function(bagName, _, value)
+    local sid = tonumber(bagName:match('^player:(%d+)$'))
+    if not sid or sid == mySid then return end
+    if value then
+        tramRiders[sid] = tramRiders[sid] or {}
+        tramRiders[sid].car = value
+    else
+        tramRiders[sid] = nil
+    end
+    rebuildSeatCache()
+end)
+
+AddStateBagChangeHandler('tramSeat', nil, function(bagName, _, value)
+    local sid = tonumber(bagName:match('^player:(%d+)$'))
+    if not sid or sid == mySid then return end
+    if tramRiders[sid] then
+        tramRiders[sid].seat = value
+        rebuildSeatCache()
+    end
+end)
 
 local function seatOffsetForSpot(spot)
     local s = Seats[spot] or Seats[1]
@@ -104,23 +137,13 @@ local function seatOffsetForSpot(spot)
 end
 
 local function takenSpots(idx)
-    local taken, count = {}, 0
-    local myId = PlayerId()
-    for _, pid in ipairs(GetActivePlayers()) do
-        if pid ~= myId then
-            local st = Player(GetPlayerServerId(pid)).state
-            if st.tramCar == idx then
-                count = count + 1
-                if st.tramSeat then taken[st.tramSeat] = true end
-            end
-        end
-    end
-    return taken, count
+    local entry = seatCache[idx]
+    return entry and entry.taken or {}, entry and entry.count or 0
 end
 
 local function carIsFull(idx)
-    local _, count = takenSpots(idx)
-    return count >= #Seats
+    local entry = seatCache[idx]
+    return entry ~= nil and entry.count >= #Seats
 end
 
 local function pickFreeSpot(idx)
@@ -242,6 +265,7 @@ createEntities = function()
             entity = e, trackIndex = index, doors = doors,
             region = region, lastRegion = region,
             doorApplied = nil, doorOpen = 0.0, runningSound = nil,
+            lastPos = nil,
         }
         cars[index] = c
         addTramTarget(c)
@@ -261,7 +285,8 @@ deleteEntities = function()
         end
         if c.entity and DoesEntityExist(c.entity) then DeleteEntity(c.entity) end
     end
-    cars = {}
+    cars      = {}
+    seatCache = {}
 end
 
 startLoops = function()
@@ -270,26 +295,36 @@ startLoops = function()
 
     CreateThread(function()
         while active and myGen == gen do
-            local now = Now()
+            local now     = Now()
+            local pedPos  = GetEntityCoords(PlayerPedId())
+            local nearCar = false
+
             for idx in pairs(Config.Cars) do
                 local pos, region, doorOpen, traveling = getCarState(idx, now)
                 local c = cars[idx]
                 if c and c.entity and DoesEntityExist(c.entity) then
                     c.region = region; c.doorOpen = doorOpen
-                    local o = Config.Cars[idx].offset
-                    SetEntityCoords(c.entity, pos.x + o.x, pos.y + o.y, pos.z + o.z, false, false, false, false)
+
+                    local p = pos + Config.Cars[idx].offset
+                    if not nearCar and #(pedPos - p) < 150.0 then nearCar = true end
+
+                    if c.lastPos ~= p then
+                        SetEntityCoords(c.entity, p.x, p.y, p.z, false, false, false, false)
+                        c.lastPos = p
+                    end
 
                     if not c.doorApplied or math.abs(doorOpen - c.doorApplied) > 0.01 then
                         setDoorPos(c, CLOSED + OPENADD * doorOpen)
                         c.doorApplied = doorOpen
                     end
+
                     if Config.Sounds then updateCarSound(c, region, traveling) end
 
                     if idx == seatedCar and riding then
                         local ped = PlayerPedId()
                         if IsEntityDead(ped) then
                             exitTram(c, true)
-                        else
+                        elseif not IsEntityAttachedToEntity(ped, c.entity) then
                             local x, y, z = seatOffsetForSpot(seatedSpot)
                             AttachEntityToEntity(ped, c.entity, -1, x, y, z, 0.0, 0.0, 0.0,
                                 false, false, false, false, 2, true)
@@ -297,7 +332,32 @@ startLoops = function()
                     end
                 end
             end
-            Wait(0)
+
+            local staleRiders = {}
+            for sid, rider in pairs(tramRiders) do
+                local c = rider.car and cars[rider.car]
+                if c and c.entity and DoesEntityExist(c.entity) then
+                    local localId = GetPlayerFromServerId(sid)
+                    if localId == -1 then
+                        -- Player disconnected; state bag may not have fired yet - clean up now
+                        staleRiders[#staleRiders + 1] = sid
+                    else
+                        local ped = GetPlayerPed(localId)
+                        if ped and ped ~= 0 and DoesEntityExist(ped) and not IsEntityDead(ped) then
+                            local x, y, z = seatOffsetForSpot(rider.seat or 1)
+                            local wp = GetOffsetFromEntityInWorldCoords(c.entity, x, y, z)
+                            SetEntityCoordsNoOffset(ped, wp.x, wp.y, wp.z, false, false, false)
+                            SetEntityHeading(ped, GetEntityHeading(c.entity))
+                        end
+                    end
+                end
+            end
+            if #staleRiders > 0 then
+                for _, sid in ipairs(staleRiders) do tramRiders[sid] = nil end
+                rebuildSeatCache()
+            end
+
+            Wait(nearCar and 0 or 50)
         end
     end)
 end
@@ -424,12 +484,14 @@ if Config.Debug then
     end, false)
 end
 
+
 local function resetRiding()
     if riding then DetachEntity(PlayerPedId(), true, true) end
     riding = false; seatedCar = nil; seatedSpot = nil
     LocalPlayer.state:set('tramCar', nil, true)
     LocalPlayer.state:set('tramSeat', nil, true)
 end
+
 RegisterNetEvent('QBX:Client:OnPlayerUnload',    resetRiding)
 RegisterNetEvent('QBCore:Client:OnPlayerUnload', resetRiding)
 
